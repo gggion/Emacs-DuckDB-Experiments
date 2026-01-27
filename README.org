@@ -1,0 +1,380 @@
+#+title: Testing the limits of duckdb SQL integration in Emacs.
+
+#+begin_quote
+[!NOTE]
+I'll try to add usage patterns to all experiments here in order to
+provide some guidance on how these tools can be used to create Emacs packages or
+integrations, and also as an excuse to document these patterns for later use.
+
+Hopefully these are helpful to you, if anything's not clear let me know or
+create an issue.
+#+end_quote
+
+This repository collects experiments, stress tests, and random ideas I've had
+about building data-centric Emacs packages with [[https://github.com/gggion/duckdb-query.el][duckdb-query.el]]. I'll keep
+adding to it as new things come to mind.
+
+Source code lives in the ~/lisp~ folder. I try to keep examples short and
+focused, ideally under 700 lines, which is about where I start losing track
+of what I'm doing.
+
+* DuckDB Spatial Cube Demo: Session Latency Benchmark
+
+[[https://github.com/gggion/Emacs-DuckDB-Experiments/blob/screenshots/CUBES-DEMO-bigger_2348x1376-compressed_1642x962.gif?raw=true]]
+
+This demonstration exists to answer a practical question: can DuckDB session
+queries respond fast enough for interactive, real-time applications in Emacs?
+The answer, as the demo shows, is *yes*: it showcases sub-4ms latency per query
+and smooth animation of 3D wireframe geometry computed entirely in SQL with the
+[[github.com/duckdb/duckdb-spatial][Spatial]] DuckDB extension.
+
+** Showcase video (for better resolution/framerate)
+
+[[https://github.com/user-attachments/assets/7044bc77-b5af-443a-bbb1-0d119666ab61]]
+
+** Why
+
+I know there are many ways of doing this directly in elisp, that's not the
+point, the idea was to see what was possible if I eliminated most of the
+processing overhead of having to spawn and kill a DuckDB CLI process for every
+query. The session executor in =duckdb-query.el= eliminates that ~22ms overhead
+by maintaining persistent processes, which made query latency drop to ~2-4ms,
+fast enough for keystroke-responsive interfaces, live filtering, and animated
+visualizations. This demo stress-tests that capability by issuing continuous
+projection queries at animation frame rates.
+
+The key metrics from the demo:
+
+| Mode        | Sessions | Latency/Query | Total Latency | Theoretical Max FPS |
+|-------------+----------+---------------+---------------+---------------------|
+| Single cube |        1 | 3.7ms         | 3.7ms         | ~270                |
+| Three cubes |        3 | 1.4ms/cube    | 4.3ms         | ~232                |
+
+The "Theoretical Max FPS" represents how fast we /could/ query based on latency
+alone (1000ms / latency). The animation timer actually fires at 33ms intervals
+(~30 FPS) because that suffices for smooth visual animation and avoids
+unnecessary CPU load. The gap between theoretical maximum and actual frame rate
+represents headroom available for Elisp rendering, garbage collection, and other
+processing:
+
+| Metric              | Single Cube | Three Cubes |
+|---------------------+-------------+-------------|
+| Query latency       | 3.7ms       | 4.3ms       |
+| Timer interval      | 33ms        | 33ms        |
+| Available headroom  | ~29ms       | ~29ms       |
+
+The three-cube mode demonstrates parallel session usage - each cube maintains its
+own DuckDB session with independent state, yet all three are queried within a
+single animation frame. The 1.4ms per-cube latency in multi-session mode shows
+that session overhead remains consistent even under concurrent use.
+** How It Works
+
+The demo initializes one or three DuckDB sessions, each loading the =spatial=
+extension and storing cube geometry as =ST_Point3D= vertices:
+
+#+begin_src elisp
+(defun duckdb-cube--init-session (name offset-x offset-y &optional scale)
+  "Initialize one cube's session."
+  (let ((session-name (format "cube-%s" name)))
+    (unless (duckdb-query-session-get session-name)
+      (duckdb-query-session-start session-name))
+
+    (duckdb-query-with-session session-name
+      (duckdb-query "INSTALL spatial; LOAD spatial;")
+
+      (duckdb-query
+       "CREATE OR REPLACE TABLE cube_vertices AS
+        SELECT * FROM (VALUES
+          (0, ST_Point3D(-1, -1, -1)),
+          (1, ST_Point3D( 1, -1, -1)),
+          ...
+        ) AS t(id, pt)")
+
+      (duckdb-query
+       "CREATE OR REPLACE TABLE cube_edges AS
+        SELECT * FROM (VALUES
+          (0, 1), (1, 2), (2, 3), (3, 0),
+          ...
+        ) AS t(v1, v2)"))
+
+    ;; Return cube state with cached edges
+    (list session-name angle-x angle-y scale offset-x offset-y
+          (duckdb-query-with-session session-name
+            (duckdb-query "SELECT v1, v2 FROM cube_edges")))))
+#+end_src
+
+Each animation frame, the demo queries each session with a rotation and
+projection transformation using =ST_Affine=:
+
+#+begin_src elisp
+(defun duckdb-cube--project-cube (cube)
+  "Project one CUBE, return vertices with screen coords."
+  (let* ((session (duckdb-cube--cube-session cube))
+         (angle-x (duckdb-cube--cube-angle-x cube))
+         (angle-y (duckdb-cube--cube-angle-y cube))
+         ...)
+    (duckdb-query-with-session session
+      (cl-incf duckdb-cube--query-count)
+      (duckdb-query
+       (format
+        "WITH
+         rotated_y AS (
+           SELECT id,
+                  ST_Affine(pt,
+                    cos(%f), 0, sin(%f),
+                    0, 1, 0,
+                    -sin(%f), 0, cos(%f),
+                    0, 0, 0) AS pt
+           FROM cube_vertices
+         ),
+         rotated AS (
+           SELECT id,
+                  ST_Affine(pt,
+                    1, 0, 0,
+                    0, cos(%f), -sin(%f),
+                    0, sin(%f), cos(%f),
+                    0, 0, 0) AS pt
+           FROM rotated_y
+         ),
+         extracted AS (
+           SELECT id, ST_X(pt) AS rx, ST_Y(pt) AS ry, ST_Z(pt) AS rz
+           FROM rotated
+         ),
+         projected AS (
+           SELECT id,
+                  (rx / (rz + 4.0)) * %f + %d AS px,
+                  (ry / (rz + 4.0)) * %f + %d AS py,
+                  rz AS depth
+           FROM extracted
+         )
+         SELECT id, CAST(px AS INTEGER) AS x, CAST(py AS INTEGER) AS y, depth
+         FROM projected ORDER BY id"
+        angle-y angle-y angle-y angle-y
+        angle-x angle-x angle-x angle-x
+        scale center-x scale center-y)))))
+#+end_src
+
+The query applies two rotation matrices via =ST_Affine= (Y-axis then X-axis),
+extracts coordinates with =ST_X=, =ST_Y=, =ST_Z=, applies perspective division,
+and returns integer screen coordinates. DuckDB computes all the linear algebra;
+Elisp receives 8 vertex coordinates and draws lines between them.
+
+** Rendering with Braille Characters
+
+The demo renders to a 200x140 "pixel" buffer using Unicode Braille characters,
+where each character cell represents a 2x4 dot matrix. This provides smoother
+lines than standard ASCII art despite terminal character limitations:
+
+#+begin_src elisp
+(defun duckdb-cube--canvas-to-braille ()
+  "Convert pixel buffer to braille string."
+  (let ((lines nil))
+    (dotimes (char-y duckdb-cube--char-height)
+      (let ((line-chars nil)
+            (py (* char-y 4)))
+        (dotimes (char-x duckdb-cube--char-width)
+          (let ((px (* char-x 2))
+                (code 0))
+            ;; Map 2x4 pixel block to braille codepoint
+            (when (aref canvas (+ px (* py w))) (setq code (logior code #x01)))
+            (when (aref canvas (+ (1+ px) (* py w))) (setq code (logior code #x08)))
+            ...
+            (push (+ #x2800 code) line-chars)))
+        (push (concat (nreverse line-chars)) lines)))
+    (mapconcat #'identity (nreverse lines) "\n")))
+#+end_src
+
+Line drawing uses [[https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm#Algorithm_for_integer_arithmetic][Bresenham's algorithm]] with depth interpolation, writing to a
+boolean pixel buffer that gets encoded as Braille characters for display.
+
+#+HEADER: :transclude [[file:lisp/duckdb-cube-demo.el]]
+#+HEADER: :transclude-lines 63-84
+#+begin_src elisp
+(defun duckdb-cube--draw-line (x1 y1 z1 x2 y2 z2)
+  "Draw line with interpolated depth."
+  (let* ((dx (abs (- x2 x1)))
+         (dy (abs (- y2 y1)))
+         (sx (if (< x1 x2) 1 -1))
+         (sy (if (< y1 y2) 1 -1))
+         (err (- dx dy))
+         (x x1) (y y1)
+         (steps (max dx dy 1))
+         (dz (/ (- z2 z1) (float steps)))
+         (z z1))
+    (catch 'done
+      (while t
+        (duckdb-cube--set-pixel x y z)
+        (when (and (= x x2) (= y y2))
+          (throw 'done nil))
+        (let ((e2 (* 2 err)))
+          (when (> e2 (- dy))
+            (setq err (- err dy) x (+ x sx)))
+          (when (< e2 dx)
+            (setq err (+ err dx) y (+ y sy))))
+        (setq z (+ z dz))))))
+#+end_src
+
+** Session Isolation in Multi-Cube Mode
+
+The three-cube mode demonstrates that sessions maintain independent state. Each
+cube has its own =cube_vertices= table in its own session's temp database:
+
+#+begin_src elisp
+(setq duckdb-cube--cubes
+      (list (duckdb-cube--init-session "left" -60 0 30.0)
+            (duckdb-cube--init-session "center" 0 0 30.0)
+            (duckdb-cube--init-session "right" 60 0 30.0)))
+#+end_src
+
+Each session is queried independently per frame, showing that
+=duckdb-query-with-session= correctly routes queries to the specified session
+even when multiple sessions exist simultaneously.
+
+** Implications for Real Applications
+
+The demo validates that session-based execution enables interactive data
+applications in Emacs. At 100+ queries per second with sub-5ms total latency,
+realistic use cases become feasible:
+
+- /Live filtering/: Update displayed results as the user types search terms
+- /Incremental aggregation/: Recompute statistics on keystroke or scroll
+- /Animated visualizations/: Render computed geometry at smooth frame rates
+- /Real-time dashboards/: Refresh multiple metrics without perceptible delay
+
+Finally, this demo proves that the architectural pattern of persistent sessions
+with =duckdb-query-with-session=, state stored in session tables and continuous
+queries for display updates transfers directly to any Emacs application that
+needs fast and responsive database interactions.
+
+** Usage Patterns
+*** Persistent Session with Extension Loading
+
+Initialize a session once, load extensions, create schema that persists across
+queries:
+
+#+begin_src elisp
+(duckdb-query-session-start "geometry")
+
+(duckdb-query-with-session "geometry"
+  ;; Extensions persist for session lifetime
+  (duckdb-query "INSTALL spatial; LOAD spatial;")
+
+  ;; Tables persist across queries
+  (duckdb-query
+   "CREATE TABLE points AS
+    SELECT id, ST_Point3D(x, y, z) AS pt
+    FROM source_data"))
+
+;; Later queries reuse loaded extension and tables
+(duckdb-query-with-session "geometry"
+  (duckdb-query "SELECT ST_X(pt), ST_Y(pt) FROM points"))
+#+end_src
+
+*** High-Frequency Query Loop
+
+Issue many queries in rapid succession, relying on session latency:
+
+#+begin_src elisp
+(let ((results nil))
+  (duckdb-query-with-session "analytics"
+    (dotimes (i 100)
+      (push (duckdb-query
+             (format "SELECT metric FROM live_data WHERE id = %d" i))
+            results)))
+  (nreverse results))
+#+end_src
+
+*** Multiple Independent Sessions
+
+Run parallel workloads with isolated state:
+
+#+begin_src elisp
+(duckdb-query-session-start "worker-1")
+(duckdb-query-session-start "worker-2")
+(duckdb-query-session-start "worker-3")
+
+;; Each session has independent tables
+(duckdb-query-with-session "worker-1"
+  (duckdb-query "CREATE TABLE scratch AS SELECT 1"))
+
+(duckdb-query-with-session "worker-2"
+  (duckdb-query "CREATE TABLE scratch AS SELECT 2"))
+
+;; Query specific session by name
+(duckdb-query "SELECT * FROM scratch"
+              :executor :session
+              :name "worker-1")
+;; => (((1)))
+#+end_src
+
+*** Timer-Driven Continuous Updates
+
+Combine sessions with Emacs timers for live-updating displays:
+
+#+begin_src elisp
+(defvar my-update-timer nil)
+
+(defun my-start-live-display ()
+  (duckdb-query-session-start "live")
+  (duckdb-query-with-session "live"
+    (duckdb-query "CREATE TABLE state AS SELECT 0 AS counter"))
+
+  (setq my-update-timer
+        (run-with-timer 0 0.1  ; 10 updates/second
+                        #'my-refresh-display)))
+
+(defun my-refresh-display ()
+  (duckdb-query-with-session "live"
+    (duckdb-query "UPDATE state SET counter = counter + 1")
+    (let ((count (duckdb-query-value "SELECT counter FROM state")))
+      (message "Count: %d" count))))
+
+(defun my-stop-live-display ()
+  (when my-update-timer
+    (cancel-timer my-update-timer))
+  (duckdb-query-session-kill "live"))
+#+end_src
+
+*** Query Timing via Hooks
+
+Monitor query performance across all sessions:
+
+#+begin_src elisp
+(defvar my-query-times nil)
+
+(add-hook 'duckdb-query-session-query-executed-functions
+          (lambda (session-name query duration-ms)
+            (push (list :session session-name
+                        :ms duration-ms
+                        :query (truncate-string-to-width query 40))
+                  my-query-times)))
+
+;; After running workload, analyze timing
+(let ((total (apply #'+ (mapcar (lambda (r) (plist-get r :ms))
+                                 my-query-times))))
+  (message "Total: %.1fms across %d queries (%.2fms avg)"
+           total
+           (length my-query-times)
+           (/ total (float (length my-query-times)))))
+#+end_src
+
+*** Transient Session for One-Off Batch Work
+
+Use =duckdb-query-with-transient-session= when you need session benefits
+(persistent state across queries) but not session longevity:
+
+#+begin_src elisp
+(duckdb-query-with-transient-session
+  ;; Session created, temp database ready
+  (duckdb-query "CREATE TABLE temp AS SELECT * FROM read_parquet('data.parquet')")
+  (duckdb-query "CREATE INDEX idx ON temp(id)")
+
+  ;; Multiple queries benefit from index
+  (let ((results nil))
+    (dolist (id '(1 5 10 50 100))
+      (push (duckdb-query-value
+             (format "SELECT value FROM temp WHERE id = %d" id))
+            results))
+    (nreverse results)))
+;; Session automatically killed, temp database deleted
+#+end_src

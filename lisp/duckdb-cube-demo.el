@@ -1,5 +1,45 @@
 ;;; duckdb-cube-demo.el --- DuckDB Spatial cube demo -*- lexical-binding: t; -*-
 
+;;; Commentary:
+
+;; Interactive 3D wireframe cube demo using DuckDB's spatial extension for
+;; all geometric computations.  Each cube maintains its own DuckDB session,
+;; testing the session executor's query latency.
+;;
+;; DuckDB computes rotation matrices via ST_Affine, applies perspective
+;; projection, and returns screen coordinates.  Elisp draws lines between
+;; vertices using Bresenham's algorithm, rendering to a Braille character
+;; canvas for visual output.
+;;
+;; Start the demo:
+;;
+;;     M-x duckdb-cube-start
+;;
+;; Controls:
+;;
+;;     +/=     Add cube (new session)
+;;     TAB     Cycle to next cube
+;;     DEL/-   Remove selected cube
+;;     h/l     Rotate or move left/right
+;;     j/k     Rotate or move up/down
+;;     m       Toggle rotate/move mode
+;;     <       Scale down
+;;     >       Scale up
+;;     a       Toggle auto-rotation
+;;     r       Reset selected cube
+;;     ?       Open transient menu
+;;     q       Quit demo
+;;
+;; The header displays real-time metrics:
+;;
+;;     Queries: 1847   | Latency:   3.7ms/cube | Queries/sec: 30
+;;
+;; Adding cubes increases query throughput linearly - each cube is one
+;; session, one query per frame.  With 5 cubes at 30 FPS, the demo
+;; sustains 150 queries/second.
+
+;;; Code:
+
 (require 'duckdb-query)
 (require 'transient)
 
@@ -60,7 +100,7 @@
         (aset duckdb-cube--depth-buffer idx depth)))))
 
 (defun duckdb-cube--draw-line (x1 y1 z1 x2 y2 z2)
-  "Draw line with interpolated depth."
+  "Draw line from X1,Y1,Z1 to X2,Y2,Z2 with interpolated depth."
   (let* ((dx (abs (- x2 x1)))
          (dy (abs (- y2 y1)))
          (sx (if (< x1 x2) 1 -1))
@@ -83,7 +123,7 @@
         (setq z (+ z dz))))))
 
 (defun duckdb-cube--canvas-to-braille ()
-  "Convert to braille string."
+  "Convert pixel buffer to braille string."
   (let ((lines nil)
         (w duckdb-cube--pixel-width))
     (dotimes (char-y duckdb-cube--char-height)
@@ -106,7 +146,7 @@
     (mapconcat #'identity (nreverse lines) "\n")))
 
 (defun duckdb-cube--init-session (name offset-x offset-y &optional scale)
-  "Initialize one cube's session."
+  "Initialize cube session NAME at OFFSET-X, OFFSET-Y with SCALE."
   (let ((session-name (format "cube-%s" name)))
     (unless (duckdb-query-session-get session-name)
       (duckdb-query-session-start session-name))
@@ -144,13 +184,13 @@
           (duckdb-query-with-session session-name
             (duckdb-query "SELECT v1, v2 FROM cube_edges")))))
 
-(defun duckdb-cube--cube-session (cube) (nth 0 cube))
-(defun duckdb-cube--cube-angle-x (cube) (nth 1 cube))
-(defun duckdb-cube--cube-angle-y (cube) (nth 2 cube))
-(defun duckdb-cube--cube-scale (cube) (nth 3 cube))
-(defun duckdb-cube--cube-offset-x (cube) (nth 4 cube))
-(defun duckdb-cube--cube-offset-y (cube) (nth 5 cube))
-(defun duckdb-cube--cube-edges (cube) (nth 6 cube))
+(defun duckdb-cube--cube-session (cube) "Session name." (nth 0 cube))
+(defun duckdb-cube--cube-angle-x (cube) "X rotation angle." (nth 1 cube))
+(defun duckdb-cube--cube-angle-y (cube) "Y rotation angle." (nth 2 cube))
+(defun duckdb-cube--cube-scale (cube) "Scale factor." (nth 3 cube))
+(defun duckdb-cube--cube-offset-x (cube) "X offset." (nth 4 cube))
+(defun duckdb-cube--cube-offset-y (cube) "Y offset." (nth 5 cube))
+(defun duckdb-cube--cube-edges (cube) "Cached edge list." (nth 6 cube))
 
 (defun duckdb-cube--set-cube-angle-x (cube val) (setcar (nthcdr 1 cube) val))
 (defun duckdb-cube--set-cube-angle-y (cube val) (setcar (nthcdr 2 cube) val))
@@ -159,7 +199,7 @@
 (defun duckdb-cube--set-cube-offset-y (cube val) (setcar (nthcdr 5 cube) val))
 
 (defun duckdb-cube--project-cube (cube)
-  "Project one CUBE, return vertices with screen coords."
+  "Project CUBE vertices via DuckDB spatial query."
   (let* ((session (duckdb-cube--cube-session cube))
          (angle-x (duckdb-cube--cube-angle-x cube))
          (angle-y (duckdb-cube--cube-angle-y cube))
@@ -223,7 +263,7 @@
         (setcdr (nthcdr 98 duckdb-cube--frame-times) nil)))))
 
 (defun duckdb-cube--render ()
-  "Render all cubes."
+  "Render all cubes to buffer."
   (when duckdb-cube--rendering
     (cl-return-from duckdb-cube--render nil))
   (setq duckdb-cube--rendering t)
@@ -272,10 +312,10 @@
                  (braille (duckdb-cube--canvas-to-braille))
                  (cube (nth duckdb-cube--selected duckdb-cube--cubes))
                  (header
-                  (format "DuckDB Spatial Demo - %d Cube%s, %d Session%s
+                  (format "DuckDB Spatial Cube Demo - %d Cube%s, %d Session%s
 Queries: %-6d | Latency: %5.1fms/cube | Queries/sec: %.0f
 Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
-[+] Add Cube | [TAB] Next | [DEL] Remove | [m] Mode | [?] Menu | [q] Quit"
+[+] Add | [TAB] Next | [DEL] Remove | [m] Mode | [?] Menu | [q] Quit"
                           num-cubes (if (= num-cubes 1) "" "s")
                           num-cubes (if (= num-cubes 1) "" "s")
                           duckdb-cube--query-count per-cube-ms queries-per-sec
@@ -312,7 +352,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
         (duckdb-cube--render)
       (error (message "Render error: %s" err)))))
 
-;;; Commands
+;;; Interactive Commands
 
 (defun duckdb-cube-next ()
   "Select next cube."
@@ -331,13 +371,12 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
          (offset-y (- (random 80) 40))
          (scale (+ 20.0 (random 20)))
          (new-cube (duckdb-cube--init-session
-                    (format "cube-%d" duckdb-cube--cube-counter)
+                    (format "dyn-%d" duckdb-cube--cube-counter)
                     offset-x offset-y scale)))
     (setq duckdb-cube--cubes (append duckdb-cube--cubes (list new-cube)))
     (setq duckdb-cube--selected (1- (length duckdb-cube--cubes)))
     (setq duckdb-cube--dirty t)
-    (message "Added cube %d (now %d cubes, %d sessions)"
-             duckdb-cube--cube-counter
+    (message "Added cube %d (%d sessions)"
              (length duckdb-cube--cubes)
              (length duckdb-cube--cubes))))
 
@@ -352,7 +391,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
       (setq duckdb-cube--selected
             (min duckdb-cube--selected (1- (length duckdb-cube--cubes))))
       (setq duckdb-cube--dirty t)
-      (message "Removed cube (now %d cubes)" (length duckdb-cube--cubes)))))
+      (message "Removed cube (%d remaining)" (length duckdb-cube--cubes)))))
 
 (defun duckdb-cube-toggle-mode ()
   "Toggle between rotate and move mode."
@@ -363,6 +402,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
   (message "Control mode: %s" (upcase (symbol-name duckdb-cube--control-mode))))
 
 (defun duckdb-cube-left ()
+  "Rotate or move selected cube left."
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (if (eq duckdb-cube--control-mode 'rotate)
@@ -373,6 +413,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
   (setq duckdb-cube--dirty t))
 
 (defun duckdb-cube-right ()
+  "Rotate or move selected cube right."
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (if (eq duckdb-cube--control-mode 'rotate)
@@ -383,6 +424,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
   (setq duckdb-cube--dirty t))
 
 (defun duckdb-cube-up ()
+  "Rotate or move selected cube up."
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (if (eq duckdb-cube--control-mode 'rotate)
@@ -393,6 +435,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
   (setq duckdb-cube--dirty t))
 
 (defun duckdb-cube-down ()
+  "Rotate or move selected cube down."
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (if (eq duckdb-cube--control-mode 'rotate)
@@ -403,18 +446,21 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
   (setq duckdb-cube--dirty t))
 
 (defun duckdb-cube-scale-up ()
+  "Increase selected cube scale."
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (duckdb-cube--set-cube-scale cube (min 80.0 (+ (duckdb-cube--cube-scale cube) 5.0))))
   (setq duckdb-cube--dirty t))
 
 (defun duckdb-cube-scale-down ()
+  "Decrease selected cube scale."
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (duckdb-cube--set-cube-scale cube (max 10.0 (- (duckdb-cube--cube-scale cube) 5.0))))
   (setq duckdb-cube--dirty t))
 
 (defun duckdb-cube-toggle-auto ()
+  "Toggle auto-rotation."
   (interactive)
   (setq duckdb-cube--auto-rotate (not duckdb-cube--auto-rotate))
   (unless duckdb-cube--auto-rotate
@@ -422,6 +468,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
   (message "Auto-rotate: %s" (if duckdb-cube--auto-rotate "ON" "OFF")))
 
 (defun duckdb-cube-reset ()
+  "Reset selected cube position and rotation."
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (duckdb-cube--set-cube-angle-x cube 0.3)
@@ -438,6 +485,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
   (setq duckdb-cube--cubes nil))
 
 (defun duckdb-cube-stop ()
+  "Stop cube demo and clean up."
   (interactive)
   (when duckdb-cube--timer
     (cancel-timer duckdb-cube--timer)
@@ -451,7 +499,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
                duckdb-cube--query-count num-cubes (if (= num-cubes 1) "" "s")
                elapsed (/ duckdb-cube--query-count elapsed)))))
 
-;;; Transient
+;;; Transient Menu
 
 (transient-define-prefix duckdb-cube-menu ()
   "Cube demo controls."
@@ -476,8 +524,9 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
    ["Session"
     ("q" "Quit" duckdb-cube-stop :transient nil)]])
 
+;;;###autoload
 (defun duckdb-cube-start ()
-  "Start cube demo."
+  "Start the DuckDB spatial cube demo."
   (interactive)
   (setq duckdb-cube--frame-times nil
         duckdb-cube--query-count 0
@@ -522,3 +571,5 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
     (local-set-key "<" #'duckdb-cube-scale-down)))
 
 (provide 'duckdb-cube-demo)
+
+;;; duckdb-cube-demo.el ends here

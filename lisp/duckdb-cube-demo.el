@@ -8,9 +8,6 @@
 (defvar duckdb-cube--interval 0.033)
 (defvar duckdb-cube--old-gc-threshold nil)
 
-;; Demo mode: 'single or 'multi
-(defvar duckdb-cube--demo-mode 'single)
-
 ;; Per-cube state: ((session angle-x angle-y scale offset-x offset-y edges-cache) ...)
 (defvar duckdb-cube--cubes nil)
 (defvar duckdb-cube--selected 0)
@@ -19,7 +16,9 @@
 (defvar duckdb-cube--rendering nil)
 (defvar duckdb-cube--frame-times nil)
 (defvar duckdb-cube--query-count 0)
-(defvar duckdb-cube--control-mode 'rotate) ; 'rotate or 'move
+(defvar duckdb-cube--start-time nil)
+(defvar duckdb-cube--control-mode 'rotate)
+(defvar duckdb-cube--cube-counter 0)
 
 ;; Canvas
 (defvar duckdb-cube--char-width 100)
@@ -36,10 +35,10 @@
   (setq duckdb-cube--pixel-width (* 2 duckdb-cube--char-width)
         duckdb-cube--pixel-height (* 4 duckdb-cube--char-height))
   (setq duckdb-cube--canvas
-        (make-bool-vector (* duckdb-cube--pixel-width 
+        (make-bool-vector (* duckdb-cube--pixel-width
                              duckdb-cube--pixel-height) nil))
   (setq duckdb-cube--depth-buffer
-        (make-vector (* duckdb-cube--pixel-width 
+        (make-vector (* duckdb-cube--pixel-width
                         duckdb-cube--pixel-height) -999.0)))
 
 (defun duckdb-cube--clear-canvas ()
@@ -111,12 +110,12 @@
   (let ((session-name (format "cube-%s" name)))
     (unless (duckdb-query-session-get session-name)
       (duckdb-query-session-start session-name))
-    
+
     (duckdb-query-with-session session-name
       (duckdb-query "INSTALL spatial; LOAD spatial;")
-      
+
       (duckdb-query
-       "CREATE OR REPLACE TABLE cube_vertices AS 
+       "CREATE OR REPLACE TABLE cube_vertices AS
         SELECT * FROM (VALUES
           (0, ST_Point3D(-1, -1, -1)),
           (1, ST_Point3D( 1, -1, -1)),
@@ -127,20 +126,19 @@
           (6, ST_Point3D( 1,  1,  1)),
           (7, ST_Point3D(-1,  1,  1))
         ) AS t(id, pt)")
-      
+
       (duckdb-query
-       "CREATE OR REPLACE TABLE cube_edges AS 
+       "CREATE OR REPLACE TABLE cube_edges AS
         SELECT * FROM (VALUES
           (0, 1), (1, 2), (2, 3), (3, 0),
           (4, 5), (5, 6), (6, 7), (7, 4),
           (0, 4), (1, 5), (2, 6), (3, 7)
         ) AS t(v1, v2)"))
-    
-    ;; Return: (session angle-x angle-y scale offset-x offset-y edges-cache)
-    (list session-name 
-          (/ (- (random 100) 50) 50.0)   ; random initial X tilt
-          (/ (random 628) 100.0)          ; random initial Y rotation
-          (or scale 35.0)                 ; scale
+
+    (list session-name
+          (/ (- (random 100) 50) 50.0)
+          (/ (random 628) 100.0)
+          (or scale 35.0)
           offset-x
           offset-y
           (duckdb-query-with-session session-name
@@ -176,9 +174,9 @@
           (cl-incf duckdb-cube--query-count)
           (duckdb-query
            (format
-            "WITH 
+            "WITH
              rotated_y AS (
-               SELECT id, 
+               SELECT id,
                       ST_Affine(pt,
                         cos(%f), 0, sin(%f),
                         0, 1, 0,
@@ -196,7 +194,7 @@
                FROM rotated_y
              ),
              extracted AS (
-               SELECT id, 
+               SELECT id,
                       ST_X(pt) AS rx,
                       ST_Y(pt) AS ry,
                       ST_Z(pt) AS rz
@@ -209,7 +207,7 @@
                       rz AS depth
                FROM extracted
              )
-             SELECT id, 
+             SELECT id,
                     CAST(px AS INTEGER) AS x,
                     CAST(py AS INTEGER) AS y,
                     depth
@@ -232,14 +230,14 @@
   (unwind-protect
       (progn
         (duckdb-cube--clear-canvas)
-        
+
         (let ((num-cubes (length duckdb-cube--cubes)))
           (dotimes (i num-cubes)
             (let* ((cube (nth i duckdb-cube--cubes))
                    (vertices (duckdb-cube--project-cube cube))
                    (edges (duckdb-cube--cube-edges cube))
                    (selected (= i duckdb-cube--selected)))
-              
+
               (dolist (edge edges)
                 (let* ((v1-id (cdr (assq 'v1 edge)))
                        (v2-id (cdr (assq 'v2 edge)))
@@ -248,63 +246,46 @@
                   (duckdb-cube--draw-line
                    (cdr (assq 'x v1)) (cdr (assq 'y v1)) (cdr (assq 'depth v1))
                    (cdr (assq 'x v2)) (cdr (assq 'y v2)) (cdr (assq 'depth v2)))))
-              
-              (dolist (v vertices)
-                (let ((x (cdr (assq 'x v)))
-                      (y (cdr (assq 'y v)))
-                      (z (cdr (assq 'depth v))))
-                  (if selected
-                      (progn
-                        (duckdb-cube--set-pixel x y z)
-                        (duckdb-cube--set-pixel (- x 1) y z)
-                        (duckdb-cube--set-pixel (+ x 1) y z)
-                        (duckdb-cube--set-pixel x (- y 1) z)
-                        (duckdb-cube--set-pixel x (+ y 1) z)
-                        (when (eq duckdb-cube--demo-mode 'multi)
-                          (duckdb-cube--set-pixel (- x 2) y z)
-                          (duckdb-cube--set-pixel (+ x 2) y z)))
-                    (duckdb-cube--set-pixel x y z))))))
-          
-          (let* ((avg-ms (if duckdb-cube--frame-times
+
+              (when selected
+                (dolist (v vertices)
+                  (let ((x (cdr (assq 'x v)))
+                        (y (cdr (assq 'y v)))
+                        (z (cdr (assq 'depth v))))
+                    (duckdb-cube--set-pixel (- x 1) y z)
+                    (duckdb-cube--set-pixel (+ x 1) y z)
+                    (duckdb-cube--set-pixel x (- y 1) z)
+                    (duckdb-cube--set-pixel x (+ y 1) z)
+                    (duckdb-cube--set-pixel (- x 2) y z)
+                    (duckdb-cube--set-pixel (+ x 2) y z))))))
+
+          (let* ((elapsed-secs (float-time (time-subtract (current-time)
+                                                          duckdb-cube--start-time)))
+                 (queries-per-sec (if (> elapsed-secs 0.5)
+                                      (/ duckdb-cube--query-count elapsed-secs)
+                                    0))
+                 (avg-ms (if duckdb-cube--frame-times
                              (/ (apply #'+ duckdb-cube--frame-times)
                                 (float (length duckdb-cube--frame-times)))
                            0))
                  (per-cube-ms (/ avg-ms (max 1 num-cubes)))
-                 (fps (if (> avg-ms 0) (/ 1000.0 avg-ms) 0))
                  (braille (duckdb-cube--canvas-to-braille))
                  (cube (nth duckdb-cube--selected duckdb-cube--cubes))
                  (header
-                  (if (eq duckdb-cube--demo-mode 'single)
-                      (format "DuckDB Spatial Demo - Single Cube
-Queries: %-6d | Latency: %5.1fms | FPS: ~%.0f
-Rot: (%+.2f, %+.2f) | Pos: (%+d, %+d) | Scale: %.0f
-Mode: %-6s | Auto: %-3s | [S] Switch to Multi | [?] Menu"
-                              duckdb-cube--query-count per-cube-ms fps
-                              (duckdb-cube--cube-angle-x cube)
-                              (duckdb-cube--cube-angle-y cube)
-                              (truncate (duckdb-cube--cube-offset-x cube))
-                              (truncate (duckdb-cube--cube-offset-y cube))
-                              (duckdb-cube--cube-scale cube)
-                              (upcase (symbol-name duckdb-cube--control-mode))
-                              (if duckdb-cube--auto-rotate "ON" "OFF"))
-                    (let ((info (mapconcat
-                                 (lambda (i)
-                                   (let ((c (nth i duckdb-cube--cubes)))
-                                     (format "%s[%d](%+3d,%+3d)"
-                                             (if (= i duckdb-cube--selected) ">" " ")
-                                             (1+ i)
-                                             (truncate (duckdb-cube--cube-offset-x c))
-                                             (truncate (duckdb-cube--cube-offset-y c)))))
-                                 '(0 1 2) " ")))
-                      (format "DuckDB Spatial Demo - 3 Cubes, 3 Sessions
-Queries: %-6d | Latency: %5.1fms/cube (%.1fms total) | FPS: ~%.0f
-%s
-Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
-                              duckdb-cube--query-count per-cube-ms avg-ms fps
-                              info
-                              (upcase (symbol-name duckdb-cube--control-mode))
-                              (if duckdb-cube--auto-rotate "ON" "OFF"))))))
-            
+                  (format "DuckDB Spatial Demo - %d Cube%s, %d Session%s
+Queries: %-6d | Latency: %5.1fms/cube | Queries/sec: %.0f
+Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
+[+] Add Cube | [TAB] Next | [DEL] Remove | [m] Mode | [?] Menu | [q] Quit"
+                          num-cubes (if (= num-cubes 1) "" "s")
+                          num-cubes (if (= num-cubes 1) "" "s")
+                          duckdb-cube--query-count per-cube-ms queries-per-sec
+                          (1+ duckdb-cube--selected) num-cubes
+                          (truncate (duckdb-cube--cube-offset-x cube))
+                          (truncate (duckdb-cube--cube-offset-y cube))
+                          (duckdb-cube--cube-scale cube)
+                          (upcase (symbol-name duckdb-cube--control-mode))
+                          (if duckdb-cube--auto-rotate "ON" "OFF"))))
+
             (with-current-buffer (get-buffer-create duckdb-cube--buffer)
               (let ((inhibit-read-only t)
                     (inhibit-modification-hooks t))
@@ -319,15 +300,13 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
     (let ((num-cubes (length duckdb-cube--cubes)))
       (dotimes (i num-cubes)
         (let* ((cube (nth i duckdb-cube--cubes))
-               (speed (if (eq duckdb-cube--demo-mode 'single)
-                          0.03
-                        (+ 0.02 (* i 0.012)))))
-          (duckdb-cube--set-cube-angle-y 
+               (speed (+ 0.02 (* i 0.008))))
+          (duckdb-cube--set-cube-angle-y
            cube (+ (duckdb-cube--cube-angle-y cube) speed))
           (when (> (duckdb-cube--cube-angle-y cube) (* 2 float-pi))
             (duckdb-cube--set-cube-angle-y cube 0.0)))))
     (setq duckdb-cube--dirty t))
-  
+
   (when (and duckdb-cube--dirty (not duckdb-cube--rendering))
     (condition-case err
         (duckdb-cube--render)
@@ -335,20 +314,50 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
 
 ;;; Commands
 
-(defun duckdb-cube-select-1 () (interactive) 
-  (when (eq duckdb-cube--demo-mode 'multi)
-    (setq duckdb-cube--selected 0 duckdb-cube--dirty t)))
-(defun duckdb-cube-select-2 () (interactive) 
-  (when (eq duckdb-cube--demo-mode 'multi)
-    (setq duckdb-cube--selected 1 duckdb-cube--dirty t)))
-(defun duckdb-cube-select-3 () (interactive) 
-  (when (eq duckdb-cube--demo-mode 'multi)
-    (setq duckdb-cube--selected 2 duckdb-cube--dirty t)))
+(defun duckdb-cube-next ()
+  "Select next cube."
+  (interactive)
+  (setq duckdb-cube--selected
+        (mod (1+ duckdb-cube--selected) (length duckdb-cube--cubes)))
+  (setq duckdb-cube--dirty t)
+  (message "Selected cube %d/%d"
+           (1+ duckdb-cube--selected) (length duckdb-cube--cubes)))
+
+(defun duckdb-cube-add ()
+  "Add a new cube with its own session."
+  (interactive)
+  (cl-incf duckdb-cube--cube-counter)
+  (let* ((offset-x (- (random 120) 60))
+         (offset-y (- (random 80) 40))
+         (scale (+ 20.0 (random 20)))
+         (new-cube (duckdb-cube--init-session
+                    (format "cube-%d" duckdb-cube--cube-counter)
+                    offset-x offset-y scale)))
+    (setq duckdb-cube--cubes (append duckdb-cube--cubes (list new-cube)))
+    (setq duckdb-cube--selected (1- (length duckdb-cube--cubes)))
+    (setq duckdb-cube--dirty t)
+    (message "Added cube %d (now %d cubes, %d sessions)"
+             duckdb-cube--cube-counter
+             (length duckdb-cube--cubes)
+             (length duckdb-cube--cubes))))
+
+(defun duckdb-cube-remove ()
+  "Remove selected cube and its session."
+  (interactive)
+  (when (> (length duckdb-cube--cubes) 1)
+    (let* ((cube (nth duckdb-cube--selected duckdb-cube--cubes))
+           (session (duckdb-cube--cube-session cube)))
+      (ignore-errors (duckdb-query-session-kill session))
+      (setq duckdb-cube--cubes (delq cube duckdb-cube--cubes))
+      (setq duckdb-cube--selected
+            (min duckdb-cube--selected (1- (length duckdb-cube--cubes))))
+      (setq duckdb-cube--dirty t)
+      (message "Removed cube (now %d cubes)" (length duckdb-cube--cubes)))))
 
 (defun duckdb-cube-toggle-mode ()
   "Toggle between rotate and move mode."
   (interactive)
-  (setq duckdb-cube--control-mode 
+  (setq duckdb-cube--control-mode
         (if (eq duckdb-cube--control-mode 'rotate) 'move 'rotate))
   (setq duckdb-cube--dirty t)
   (message "Control mode: %s" (upcase (symbol-name duckdb-cube--control-mode))))
@@ -357,9 +366,9 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (if (eq duckdb-cube--control-mode 'rotate)
-        (duckdb-cube--set-cube-angle-y 
+        (duckdb-cube--set-cube-angle-y
          cube (- (duckdb-cube--cube-angle-y cube) 0.15))
-      (duckdb-cube--set-cube-offset-x 
+      (duckdb-cube--set-cube-offset-x
        cube (- (duckdb-cube--cube-offset-x cube) 8))))
   (setq duckdb-cube--dirty t))
 
@@ -367,9 +376,9 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (if (eq duckdb-cube--control-mode 'rotate)
-        (duckdb-cube--set-cube-angle-y 
+        (duckdb-cube--set-cube-angle-y
          cube (+ (duckdb-cube--cube-angle-y cube) 0.15))
-      (duckdb-cube--set-cube-offset-x 
+      (duckdb-cube--set-cube-offset-x
        cube (+ (duckdb-cube--cube-offset-x cube) 8))))
   (setq duckdb-cube--dirty t))
 
@@ -377,9 +386,9 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (if (eq duckdb-cube--control-mode 'rotate)
-        (duckdb-cube--set-cube-angle-x 
+        (duckdb-cube--set-cube-angle-x
          cube (- (duckdb-cube--cube-angle-x cube) 0.15))
-      (duckdb-cube--set-cube-offset-y 
+      (duckdb-cube--set-cube-offset-y
        cube (- (duckdb-cube--cube-offset-y cube) 8))))
   (setq duckdb-cube--dirty t))
 
@@ -387,9 +396,9 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
   (interactive)
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (if (eq duckdb-cube--control-mode 'rotate)
-        (duckdb-cube--set-cube-angle-x 
+        (duckdb-cube--set-cube-angle-x
          cube (+ (duckdb-cube--cube-angle-x cube) 0.15))
-      (duckdb-cube--set-cube-offset-y 
+      (duckdb-cube--set-cube-offset-y
        cube (+ (duckdb-cube--cube-offset-y cube) 8))))
   (setq duckdb-cube--dirty t))
 
@@ -417,9 +426,9 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
   (let ((cube (nth duckdb-cube--selected duckdb-cube--cubes)))
     (duckdb-cube--set-cube-angle-x cube 0.3)
     (duckdb-cube--set-cube-angle-y cube 0.0)
-    (when (eq duckdb-cube--demo-mode 'single)
-      (duckdb-cube--set-cube-offset-x cube 0)
-      (duckdb-cube--set-cube-offset-y cube 0)))
+    (duckdb-cube--set-cube-offset-x cube 0)
+    (duckdb-cube--set-cube-offset-y cube 0)
+    (duckdb-cube--set-cube-scale cube 35.0))
   (setq duckdb-cube--dirty t))
 
 (defun duckdb-cube--cleanup-sessions ()
@@ -428,29 +437,6 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
     (ignore-errors (duckdb-query-session-kill (duckdb-cube--cube-session cube))))
   (setq duckdb-cube--cubes nil))
 
-(defun duckdb-cube-switch-demo ()
-  "Switch between single and multi-cube demo."
-  (interactive)
-  (duckdb-cube--cleanup-sessions)
-  (setq duckdb-cube--frame-times nil
-        duckdb-cube--query-count 0
-        duckdb-cube--selected 0)
-  
-  (if (eq duckdb-cube--demo-mode 'single)
-      (progn
-        (setq duckdb-cube--demo-mode 'multi)
-        (setq duckdb-cube--cubes
-              (list (duckdb-cube--init-session "left" -60 0 30.0)
-                    (duckdb-cube--init-session "center" 0 0 30.0)
-                    (duckdb-cube--init-session "right" 60 0 30.0)))
-        (message "Switched to Multi-Cube (3 sessions)"))
-    (setq duckdb-cube--demo-mode 'single)
-    (setq duckdb-cube--cubes
-          (list (duckdb-cube--init-session "main" 0 0 50.0)))
-    (message "Switched to Single Cube"))
-  
-  (setq duckdb-cube--dirty t))
-
 (defun duckdb-cube-stop ()
   (interactive)
   (when duckdb-cube--timer
@@ -458,8 +444,12 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
     (setq duckdb-cube--timer nil))
   (when duckdb-cube--old-gc-threshold
     (setq gc-cons-threshold duckdb-cube--old-gc-threshold))
-  (duckdb-cube--cleanup-sessions)
-  (message "Stopped. %d total queries" duckdb-cube--query-count))
+  (let ((num-cubes (length duckdb-cube--cubes)))
+    (duckdb-cube--cleanup-sessions)
+    (let ((elapsed (float-time (time-subtract (current-time) duckdb-cube--start-time))))
+      (message "Stopped. %d queries across %d session%s in %.1fs (%.0f queries/sec)"
+               duckdb-cube--query-count num-cubes (if (= num-cubes 1) "" "s")
+               elapsed (/ duckdb-cube--query-count elapsed)))))
 
 ;;; Transient
 
@@ -467,10 +457,10 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
   "Cube demo controls."
   :transient-suffix 'transient--do-stay
   ["DuckDB Spatial Cube Demo"
-   ["Select (Multi)"
-    ("1" "Cube 1" duckdb-cube-select-1)
-    ("2" "Cube 2" duckdb-cube-select-2)
-    ("3" "Cube 3" duckdb-cube-select-3)]
+   ["Cubes"
+    ("+" "Add cube" duckdb-cube-add)
+    ("TAB" "Next cube" duckdb-cube-next)
+    ("DEL" "Remove cube" duckdb-cube-remove)]
    ["Control"
     ("m" "Toggle mode" duckdb-cube-toggle-mode)
     ("h" "Left" duckdb-cube-left)
@@ -482,8 +472,7 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
     (">" "Bigger" duckdb-cube-scale-up)
     ("<" "Smaller" duckdb-cube-scale-down)]
    ["Animation"
-    ("a" "Toggle auto" duckdb-cube-toggle-auto)
-    ("S" "Switch demo" duckdb-cube-switch-demo)]
+    ("a" "Toggle auto" duckdb-cube-toggle-auto)]
    ["Session"
     ("q" "Quit" duckdb-cube-stop :transient nil)]])
 
@@ -492,34 +481,36 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
   (interactive)
   (setq duckdb-cube--frame-times nil
         duckdb-cube--query-count 0
+        duckdb-cube--start-time (current-time)
         duckdb-cube--auto-rotate t
         duckdb-cube--dirty t
         duckdb-cube--rendering nil
         duckdb-cube--selected 0
         duckdb-cube--control-mode 'rotate
-        duckdb-cube--demo-mode 'single)
-  
-  ;; Start with single cube
+        duckdb-cube--cube-counter 0)
+
   (setq duckdb-cube--cubes
-        (list (duckdb-cube--init-session "main" 0 0 50.0)))
-  
+        (list (duckdb-cube--init-session "main" 0 0 40.0)))
+
   (duckdb-cube--init-canvas)
-  
+
   (setq duckdb-cube--old-gc-threshold gc-cons-threshold)
   (setq gc-cons-threshold (* 100 1024 1024))
-  
+
   (duckdb-cube--render)
   (pop-to-buffer duckdb-cube--buffer)
   (setq duckdb-cube--timer
         (run-with-timer 0 duckdb-cube--interval #'duckdb-cube--tick))
-  
+
   (with-current-buffer duckdb-cube--buffer
     (use-local-map (make-sparse-keymap))
     (local-set-key "?" #'duckdb-cube-menu)
     (local-set-key "q" #'duckdb-cube-stop)
-    (local-set-key "1" #'duckdb-cube-select-1)
-    (local-set-key "2" #'duckdb-cube-select-2)
-    (local-set-key "3" #'duckdb-cube-select-3)
+    (local-set-key "+" #'duckdb-cube-add)
+    (local-set-key "=" #'duckdb-cube-add)
+    (local-set-key "\t" #'duckdb-cube-next)
+    (local-set-key (kbd "DEL") #'duckdb-cube-remove)
+    (local-set-key "-" #'duckdb-cube-remove)
     (local-set-key "m" #'duckdb-cube-toggle-mode)
     (local-set-key "h" #'duckdb-cube-left)
     (local-set-key "l" #'duckdb-cube-right)
@@ -528,7 +519,6 @@ Mode: %-6s | Auto: %-3s | [1-3] Select | [S] Switch to Single | [?] Menu"
     (local-set-key "a" #'duckdb-cube-toggle-auto)
     (local-set-key "r" #'duckdb-cube-reset)
     (local-set-key ">" #'duckdb-cube-scale-up)
-    (local-set-key "<" #'duckdb-cube-scale-down)
-    (local-set-key "S" #'duckdb-cube-switch-demo)))
+    (local-set-key "<" #'duckdb-cube-scale-down)))
 
 (provide 'duckdb-cube-demo)

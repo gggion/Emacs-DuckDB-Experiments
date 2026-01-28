@@ -28,9 +28,6 @@ The answer, as the demo shows, is *yes*: it showcases sub-4ms latency per query
 and smooth animation of 3D wireframe geometry computed entirely in SQL with the
 [[github.com/duckdb/duckdb-spatial][Spatial]] DuckDB extension.
 
-** Showcase video (for better resolution/framerate)
-
-[[https://github.com/user-attachments/assets/7044bc77-b5af-443a-bbb1-0d119666ab61]]
 
 ** Why
 

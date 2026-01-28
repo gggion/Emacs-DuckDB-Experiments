@@ -48,6 +48,12 @@
 (defvar duckdb-cube--interval 0.033)
 (defvar duckdb-cube--old-gc-threshold nil)
 
+;; query/second metrics
+(defvar duckdb-cube--recent-query-times nil
+  "Ring buffer of recent query timestamps for throughput calculation.")
+(defvar duckdb-cube--query-window 2.0
+  "Window in seconds for queries/sec calculation.")
+
 ;; Per-cube state: ((session angle-x angle-y scale offset-x offset-y edges-cache) ...)
 (defvar duckdb-cube--cubes nil)
 (defvar duckdb-cube--selected 0)
@@ -91,7 +97,7 @@
   (+ x (* y duckdb-cube--pixel-width)))
 
 (defun duckdb-cube--set-pixel (x y depth)
-  "Set pixel at X,Y with depth test."
+  "Set pixel at X,Y with DEPTH test."
   (when (and (>= x 0) (< x duckdb-cube--pixel-width)
              (>= y 0) (< y duckdb-cube--pixel-height))
     (let ((idx (duckdb-cube--pixel-index x y)))
@@ -212,6 +218,8 @@
     (prog1
         (duckdb-query-with-session session
           (cl-incf duckdb-cube--query-count)
+          ;; Record timestamp for sliding window
+          (push (current-time) duckdb-cube--recent-query-times)
           (duckdb-query
            (format
             "WITH
@@ -257,6 +265,7 @@
             angle-x angle-x angle-x angle-x
             scale (+ center-x offset-x)
             scale (+ center-y offset-y))))
+      ;; Record frame time for latency display
       (push (* 1000 (float-time (time-subtract (current-time) start-time)))
             duckdb-cube--frame-times)
       (when (> (length duckdb-cube--frame-times) 100)
@@ -299,38 +308,52 @@
                     (duckdb-cube--set-pixel (- x 2) y z)
                     (duckdb-cube--set-pixel (+ x 2) y z))))))
 
-          (let* ((elapsed-secs (float-time (time-subtract (current-time)
-                                                          duckdb-cube--start-time)))
-                 (queries-per-sec (if (> elapsed-secs 0.5)
-                                      (/ duckdb-cube--query-count elapsed-secs)
-                                    0))
+          ;; Trim old query timestamps outside window
+          (let ((now (current-time))
+                (cutoff (* 2 duckdb-cube--query-window)))
+            (setq duckdb-cube--recent-query-times
+                  (seq-filter (lambda (ts)
+                                (< (float-time (time-subtract now ts)) cutoff))
+                              duckdb-cube--recent-query-times)))
+
+          ;; Calculate queries/sec from sliding window
+          (let* ((now (current-time))
+                 (recent-count (length (seq-filter
+                                        (lambda (ts)
+                                          (< (float-time (time-subtract now ts))
+                                             duckdb-cube--query-window))
+                                        duckdb-cube--recent-query-times)))
+                 (queries-per-sec (/ recent-count duckdb-cube--query-window))
                  (avg-ms (if duckdb-cube--frame-times
                              (/ (apply #'+ duckdb-cube--frame-times)
                                 (float (length duckdb-cube--frame-times)))
                            0))
                  (per-cube-ms (/ avg-ms (max 1 num-cubes)))
                  (braille (duckdb-cube--canvas-to-braille))
-                 (cube (nth duckdb-cube--selected duckdb-cube--cubes))
-                 (header
-                  (format "DuckDB Spatial Cube Demo - %d Cube%s, %d Session%s
-Queries: %-6d | Latency: %5.1fms/cube | Queries/sec: %.0f
-Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
-[+] Add | [TAB] Next | [DEL] Remove | [m] Mode | [?] Menu | [q] Quit"
-                          num-cubes (if (= num-cubes 1) "" "s")
-                          num-cubes (if (= num-cubes 1) "" "s")
-                          duckdb-cube--query-count per-cube-ms queries-per-sec
-                          (1+ duckdb-cube--selected) num-cubes
-                          (truncate (duckdb-cube--cube-offset-x cube))
-                          (truncate (duckdb-cube--cube-offset-y cube))
-                          (duckdb-cube--cube-scale cube)
-                          (upcase (symbol-name duckdb-cube--control-mode))
-                          (if duckdb-cube--auto-rotate "ON" "OFF"))))
+                 (cube (nth duckdb-cube--selected duckdb-cube--cubes)))
 
             (with-current-buffer (get-buffer-create duckdb-cube--buffer)
               (let ((inhibit-read-only t)
                     (inhibit-modification-hooks t))
                 (erase-buffer)
-                (insert header "\n" braille))))))
+               (let ((title (format "DuckDB Spatial Cube Demo - %d Cube%s, %d Session%s"
+                                     num-cubes (if (= num-cubes 1) "" "s")
+                                     num-cubes (if (= num-cubes 1) "" "s")))
+                      (stats (format "Queries: %-6d | Latency: %5.1fms/cube | Queries/sec: %.0f"
+                                     duckdb-cube--query-count per-cube-ms queries-per-sec))
+                      (info (format "Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s"
+                                    (1+ duckdb-cube--selected) num-cubes
+                                    (truncate (duckdb-cube--cube-offset-x cube))
+                                    (truncate (duckdb-cube--cube-offset-y cube))
+                                    (duckdb-cube--cube-scale cube)
+                                    (upcase (symbol-name duckdb-cube--control-mode))
+                                    (if duckdb-cube--auto-rotate "ON" "OFF")))
+                      (help "[+] Add | [TAB] Next | [DEL] Remove | [m] Mode | [?] Menu | [q] Quit"))
+                  (insert (propertize title 'face '(:height 1.4 :weight bold)) "\n")
+                  (insert (propertize stats 'face '(:height 1.4 :weight bold)) "\n")
+                  (insert (propertize info 'face '(:height 1.1)) "\n")
+                  (insert (propertize help 'face '(:height 1.0 :slant italic)) "\n"))
+                (insert braille))))))
     (setq duckdb-cube--rendering nil
           duckdb-cube--dirty nil)))
 
@@ -492,12 +515,18 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
     (setq duckdb-cube--timer nil))
   (when duckdb-cube--old-gc-threshold
     (setq gc-cons-threshold duckdb-cube--old-gc-threshold))
-  (let ((num-cubes (length duckdb-cube--cubes)))
+  (let* ((num-cubes (length duckdb-cube--cubes))
+         (now (current-time))
+         (recent-count (length (seq-filter
+                                (lambda (ts)
+                                  (< (float-time (time-subtract now ts))
+                                     duckdb-cube--query-window))
+                                duckdb-cube--recent-query-times)))
+         (queries-per-sec (/ recent-count duckdb-cube--query-window)))
     (duckdb-cube--cleanup-sessions)
-    (let ((elapsed (float-time (time-subtract (current-time) duckdb-cube--start-time))))
-      (message "Stopped. %d queries across %d session%s in %.1fs (%.0f queries/sec)"
-               duckdb-cube--query-count num-cubes (if (= num-cubes 1) "" "s")
-               elapsed (/ duckdb-cube--query-count elapsed)))))
+    (message "Stopped. %d queries across %d session%s (%.0f queries/sec at exit)"
+             duckdb-cube--query-count num-cubes (if (= num-cubes 1) "" "s")
+             queries-per-sec)))
 
 ;;; Transient Menu
 
@@ -529,6 +558,7 @@ Selected: [%d/%d] Pos:(%+d,%+d) Scale:%.0f | Mode: %s | Auto: %s
   "Start the DuckDB spatial cube demo."
   (interactive)
   (setq duckdb-cube--frame-times nil
+        duckdb-cube--recent-query-times nil  ; Reset sliding window
         duckdb-cube--query-count 0
         duckdb-cube--start-time (current-time)
         duckdb-cube--auto-rotate t
